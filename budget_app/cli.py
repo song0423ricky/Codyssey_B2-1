@@ -4,17 +4,18 @@ from pathlib import Path      #경로호출 클래스
 
 from .models import Transaction                #거래 1건 클래스
 from .repository import TransactionRepository  #저장소 클래스
- 
+from .service import latest  #????
 
 def ask_date() -> str:                            #날짜 확인
     while True:
         raw = input("날짜(YYYY-MM-DD): ").strip() #입력받기
         try:
-            datetime.strptime(raw, "%Y-%m-%d") #strptime- -> 문자열을 날짜로 해석해 보는 함수, %Y는 4자리 연도, %m은 월, %d는 일
-            return raw                         #해석 성공하면 반환
+           parsed = datetime.strptime(raw, "%Y-%m-%d")
         except ValueError:                                              #형식 틀리면
             print("[오류] 날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).")  #오류출력후 재시도
-            print("[힌트] 예: 2024-01-15")
+            print("[힌트] 예: 2004-04-23")
+            continue
+        return parsed.strftime("%Y-%m-%d")
 
 
 def ask_type() -> str: #income,expense 판단
@@ -50,6 +51,20 @@ def ask_tags() -> list[str]:                                #태그 입력
     raw = input("태그(쉼표로 구분, 없으면 엔터): ")         
     return [t.strip() for t in raw.split(",") if t.strip()] #리스트 컴프리헨션으로 쉼표 기준으로 자르고 공백 빼고 내용이 있으면 공백 뺀 값을 추가해서 리스트로 리턴
 
+def positive_int(value: str) -> int: #????
+    """argparse용: 옵션 값이 양의 정수인지 검사"""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"양의 정수를 입력하세요 (입력값: {value})")
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"1 이상이어야 합니다 (입력값: {value})")
+    return n
+
+
+def format_tx(tx: Transaction) -> str:#???
+    """거래 한 건을 한 줄 문자열로"""
+    return f"{tx.id} | {tx.date} | {tx.type:<7} | {tx.category} | {tx.amount} | {tx.memo}"
 
 # ---------- 명령 ----------
 
@@ -74,6 +89,15 @@ def cmd_add(repo: TransactionRepository) -> int: #main()에서 호출되는 add 
     print(f"[저장 완료] id={tx.id}")
     return 0 #0 반환해서 끝내기 
 
+def cmd_list(repo: TransactionRepository, limit: int) -> int:#????
+    rows = latest(repo.iter_all(), limit)
+    if not rows:
+        print("거래 내역이 없습니다.")
+        print("[힌트] add 명령으로 거래를 먼저 추가하세요: py -m budget_app add")
+        return 0
+    for tx in rows:
+        print(format_tx(tx))
+    return 0
 
 # ---------- 명령어 해석 ----------
 
@@ -87,6 +111,10 @@ def build_parser() -> argparse.ArgumentParser: #터미널에 입력한 명령어
 
     sub = parser.add_subparsers(dest="command", required=True) #하위 명령어를 넣을 공간을 만들어 sub에 저장,dest="command" -> 입력된 명령어 이름을 args.command에 저장, required=True -> 명령어를 꼭 입력해야 한다는 뜻
     sub.add_parser("add", help="거래 추가 (대화형 입력)")       #add라는 하위 명령어를 등록,사용자가 add를 입력하면 args.command에 "add"가 들어감
+
+    p_list = sub.add_parser("list", help="거래 목록 (최신순)")#?????
+    p_list.add_argument("--limit", type=positive_int, default=10,
+                        help="출력할 최대 개수 (기본값: 10)")
     return parser #설정이 끝난 해석기 반환, 실제 해석은 main의 parser.parse_args(argv)에서함
 
 
@@ -103,4 +131,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "add": # 입력된 명령어가 add면
         return cmd_add(repo)  #거래 추가 실행하고, 그 결과(성공 시 0)를 그대로 돌려줌
+    if args.command == "list": #????
+        return cmd_list(repo, args.limit)
     return 1                  # 처리할 수 없는 명령어면 1(실패) 반환
