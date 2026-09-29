@@ -2,4 +2,4 @@ __pycache__/
 *.pyc
 data/
 *.tmp
-.DS_Store
+.DS_Storegit init
