@@ -1,23 +1,105 @@
-from dataclasses import dataclass, field, asdict #dataclass: 데이터 클래스 데코레이터, field: 필드 정의, asdict: 데이터 클래스 인스턴스를 딕셔너리로 변환하는 함수
+"""모델 계층: 프로그램에서 주고받는 데이터의 '모양'만 정의한다 (파일 I/O, 출력 없음)."""
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
-@dataclass #데코레이터 
-class Transaction:# 거래 1건을 표현하는데이터 클래스 
+@dataclass
+class Transaction:
+    """거래 내역 한 건"""
+
     id: str
     type: str          # "income" 또는 "expense"
     date: str          # "YYYY-MM-DD"
-    amount: int
+    amount: int        # 양의 정수
     category: str
-    memo: str = ""     #기본값이 있는 필드는 반드시 기본값 없는 필드보다 뒤에 와야 에러안남.
+    memo: str = ""
     tags: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict: #객체를 딕셔너리로 바꾸기, JSON은 딕셔너리만 저장가능.
-        return asdict(self) #asdict -> 데이터 클래스(dataclass) 인스턴스를 딕셔너리(dictionary)로 변환하는 표준 라이브러리 함수
+    def to_dict(self) -> dict[str, Any]:
+        """파일에 저장하기 위한 딕셔너리로 변환"""
+        return asdict(self)
 
-    @classmethod #메서드를 클래스 이름으로 직접 부를 수 있고, 첫 번째 인자로 객체 대신 클래스 자신호출
-    def from_dict(cls, data: dict) -> "Transaction": #cls = 클래스자체를 첫 번째 매개변수로 전달받기 위해 사용하는 관례적인 이름,self느낌인데 여기서는 Transaction클래스임
-        """from_dict는 파일에서 딕셔너리 데이터 가져와야되서 to_dict과 다르게 객체가 부르는 시점에 없음
-        -> 그래서 클래스 메서드로 정의하고, 첫 번째 매개변수로 cls를 받음, 즉 Transaction클래스를 객체느낌으로 사용"""
-        return cls(**data) 
-        """ data가 딕셔너리 형태임으로 **으로 딕셔너리를 "키=값" 형태로 풀어서 함수에 넣음
-        -> **data = {id="TX-000001", type="expense", date="2024-01-15",amount=15000, category="food", memo="점심", tags=["meal"]}"""
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Transaction":
+        """파일에서 읽은 딕셔너리를 Transaction으로 변환 (필수 키가 없으면 KeyError)"""
+        tags = data.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+        return cls(
+            id=str(data["id"]),
+            type=str(data["type"]),
+            date=str(data["date"]),
+            amount=int(data["amount"]),
+            category=str(data["category"]),
+            memo=str(data.get("memo") or ""),
+            tags=[str(t) for t in tags],
+        )
+
+
+@dataclass
+class SearchFilter:
+    """검색/내보내기 조건. None인 조건은 검사하지 않는다 (모든 조건은 AND)."""
+
+    date_from: str | None = None   # 이 날짜 이후 (포함)
+    date_to: str | None = None     # 이 날짜 이전 (포함)
+    month: str | None = None       # "YYYY-MM"
+    category: str | None = None
+    tx_type: str | None = None
+    keyword: str | None = None     # 메모에 포함된 글자 (대소문자 무시)
+    tag: str | None = None         # 태그 중 하나와 일치 (대소문자 무시)
+
+    def matches(self, tx: Transaction) -> bool:
+        if self.date_from and tx.date < self.date_from:
+            return False
+        if self.date_to and tx.date > self.date_to:
+            return False
+        if self.month and not tx.date.startswith(self.month + "-"):
+            return False
+        if self.category and tx.category != self.category:
+            return False
+        if self.tx_type and tx.type != self.tx_type:
+            return False
+        if self.keyword and self.keyword.lower() not in tx.memo.lower():
+            return False
+        if self.tag and self.tag.lower() not in (t.lower() for t in tx.tags):
+            return False
+        return True
+
+
+@dataclass
+class MonthlySummary:
+    """월별 요약 결과"""
+
+    month: str
+    count: int
+    income: int
+    expense: int
+    top_categories: list[tuple[str, int]]
+    budget: int | None = None
+
+    @property
+    def balance(self) -> int:
+        return self.income - self.expense
+
+    @property
+    def usage_rate(self) -> float | None:
+        """예산 대비 지출 비율(%). 예산이 없으면 None"""
+        if not self.budget:
+            return None
+        return self.expense / self.budget * 100
+
+    @property
+    def over_amount(self) -> int:
+        """예산 초과 금액. 초과하지 않았거나 예산이 없으면 0"""
+        if not self.budget:
+            return 0
+        return max(0, self.expense - self.budget)
+
+
+@dataclass
+class ImportResult:
+    """CSV 가져오기 결과"""
+
+    imported: int = 0
+    skipped: int = 0
+    errors: list[str] = field(default_factory=list)

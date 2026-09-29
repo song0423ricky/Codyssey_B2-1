@@ -1,136 +1,416 @@
-import argparse               #터미널 명령어 인자 해석 표준 터미널
-from datetime import datetime #날짜 형식이 맞는지 검사하는 데 사용
-from pathlib import Path      #경로호출 클래스
+"""CLI 계층: 명령어 해석(argparse), 대화형 입력, 화면 출력만 담당한다.
 
-from .models import Transaction                #거래 1건 클래스
-from .repository import TransactionRepository  #저장소 클래스
-from .service import latest  #????
+실제 규칙과 계산은 service.py, 파일 입출력은 repository.py / csv_io.py가 한다.
+"""
+import argparse
+import logging
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, TypeVar
 
-def ask_date() -> str:                            #날짜 확인
+from . import __version__
+from .decorators import EXIT_ERROR, EXIT_OK, handle_errors, log_execution, print_error
+from .errors import BudgetAppError
+from .formatter import format_summary, format_transaction_line, format_transactions, won
+from .models import SearchFilter
+from .repository import DEFAULT_CATEGORIES, BudgetStore, CategoryStore, TransactionRepository
+from .service import BudgetService
+from .validators import (
+    parse_amount,
+    parse_category_name,
+    parse_date,
+    parse_month,
+    parse_tags,
+    parse_tx_id,
+    parse_type,
+)
+
+T = TypeVar("T")
+Handler = Callable[[argparse.Namespace, BudgetService], int]
+
+
+# ====================== 입력 도우미 ======================
+
+def ask(prompt: str, parse: Callable[[str], T]) -> T:
+    """올바른 값이 들어올 때까지 다시 묻는다 (오류 + 힌트 출력)."""
     while True:
-        raw = input("날짜(YYYY-MM-DD): ").strip() #입력받기
+        raw = input(prompt)
         try:
-           parsed = datetime.strptime(raw, "%Y-%m-%d")
-        except ValueError:                                              #형식 틀리면
-            print("[오류] 날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).")  #오류출력후 재시도
-            print("[힌트] 예: 2004-04-23")
-            continue
-        return parsed.strftime("%Y-%m-%d")
+            return parse(raw)
+        except BudgetAppError as e:
+            print_error(e.message, e.hint, file=sys.stdout)
 
 
-def ask_type() -> str: #income,expense 판단
-    while True:
-        raw = input("타입(income/expense): ").strip().lower()    #소문자로 바꿔서 income,expense 판단
-        if raw in ("income", "expense"):                         #둘중 하나면 반환
-            return raw
-        print("[오류] income 또는 expense만 입력할 수 있습니다.") #아니면 오류후 재입력
+def optional(value: str | None, parse: Callable[[str], T]) -> T | None:
+    """옵션이 주어졌을 때만 검증한다 (주어지지 않으면 None)."""
+    return None if value is None else parse(value)
 
 
-def ask_category() -> str:                #카테고리 입력
-    while True:
-        raw = input("카테고리: ").strip() 
-        if raw:                               #뭐라도 입력하면 통과
-            return raw
-        print("[오류] 카테고리를 입력하세요.") #아니면 재입력
-
-
-def ask_amount() -> int:                    #금액 입력
-    while True:
-        raw = input("금액(양수): ").strip() #금액 입력받기
-        try:
-            amount = int(raw)              #int로 바꿔보기
-        except ValueError:                 #안되면 0
-            amount = 0
-        if amount > 0:                     #0이 아니면(오류가 아니면) 반환
-            return amount
-        print("[오류] 금액은 0보다 큰 정수여야 합니다.") #0이면 int변환 안되거나 amount<=0 임으로 오류 출력
-        print("[힌트] 예: 15000 (쉼표 없이)")
-
-
-def ask_tags() -> list[str]:                                #태그 입력
-    raw = input("태그(쉼표로 구분, 없으면 엔터): ")         
-    return [t.strip() for t in raw.split(",") if t.strip()] #리스트 컴프리헨션으로 쉼표 기준으로 자르고 공백 빼고 내용이 있으면 공백 뺀 값을 추가해서 리스트로 리턴
-
-def positive_int(value: str) -> int: #????
-    """argparse용: 옵션 값이 양의 정수인지 검사"""
+def positive_int(value: str) -> int:
+    """argparse용 검사기: --limit, --top 값은 1 이상의 정수"""
     try:
         n = int(value)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"양의 정수를 입력하세요 (입력값: {value})")
+        raise argparse.ArgumentTypeError(f"양의 정수를 입력하세요 (입력값: {value})") from None
     if n <= 0:
         raise argparse.ArgumentTypeError(f"1 이상이어야 합니다 (입력값: {value})")
     return n
 
 
-def format_tx(tx: Transaction) -> str:#???
-    """거래 한 건을 한 줄 문자열로"""
-    return f"{tx.id} | {tx.date} | {tx.type:<7} | {tx.category} | {tx.amount} | {tx.memo}"
+# ====================== 명령 ======================
 
-# ---------- 명령 ----------
-
-def cmd_add(repo: TransactionRepository) -> int: #main()에서 호출되는 add 명령 처리 함수, repo는 TransactionRepository 객체
-    date = ask_date()
-    tx_type = ask_type()
-    category = ask_category()
-    amount = ask_amount()
-    memo = input("메모(선택): ").strip() #메모는 선택사항이라 검사없이 넣기, 비정상 입력 시 프로그램이 죽지 않아야 하면 수정
-    tags = ask_tags()
-
-    tx = Transaction(      #받은 값들로 Transaction 객체 생성
-        id=repo.next_id(),
-        type=tx_type,
-        date=date,
-        amount=amount,
-        category=category,
-        memo=memo,
-        tags=tags,
+@log_execution
+def cmd_add(args: argparse.Namespace, service: BudgetService) -> int:
+    print("새 거래를 입력하세요. (중단: Ctrl+C)")
+    date = ask("날짜(YYYY-MM-DD): ", parse_date)
+    tx_type = ask("타입(income/expense): ", parse_type)
+    print(f"  등록된 카테고리: {', '.join(service.list_categories())}")
+    category = ask(
+        "카테고리: ",
+        lambda raw: service.require_category(parse_category_name(raw)),
     )
-    repo.add(tx)#완성된 거래 객체를 저장소의 add()에 넘겨서 transactions.jsonl 파일 끝에 한 줄로 저장
-    print(f"[저장 완료] id={tx.id}")
-    return 0 #0 반환해서 끝내기 
+    amount = ask("금액(양수): ", parse_amount)
+    memo = input("메모(선택): ").strip()
+    tags = parse_tags(input("태그(쉼표로 구분, 없으면 엔터): "))
 
-def cmd_list(repo: TransactionRepository, limit: int) -> int:#????
-    rows = latest(repo.iter_all(), limit)
+    tx = service.add_transaction(
+        date=date, tx_type=tx_type, category=category,
+        amount=amount, memo=memo, tags=tags,
+    )
+    print(f"[저장 완료] id={tx.id}")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_list(args: argparse.Namespace, service: BudgetService) -> int:
+    rows = service.latest(args.limit)
     if not rows:
         print("거래 내역이 없습니다.")
-        print("[힌트] add 명령으로 거래를 먼저 추가하세요: py -m budget_app add")
-        return 0
-    for tx in rows:
-        print(format_tx(tx))
-    return 0
+        print("[힌트] add 명령으로 거래를 추가하세요: python -m budget_app add")
+        return EXIT_OK
+    print(format_transactions(rows))
+    print(f"(최신순 {len(rows)}건 표시, --limit {args.limit})")
+    return EXIT_OK
 
-# ---------- 명령어 해석 ----------
 
-def build_parser() -> argparse.ArgumentParser: #터미널에 입력한 명령어를 어떻게 해석할지 규칙을 정하기
-    parser = argparse.ArgumentParser(          #명령어 해석기 객체를 만들어 parser에 저장합니다. 괄호 안에 설정값을 넣음
-        prog="budget_app",                     #프로그램 이름을 budget_app으로 정함,도움말이나 오류 메시지에 이 이름이 표시됨
-        description="용돈 기입장 콘솔 프로그램", # --help를 입력하면 보이는 프로그램 설명
+@log_execution
+def cmd_search(args: argparse.Namespace, service: BudgetService) -> int:
+    flt = SearchFilter(
+        date_from=optional(args.date_from, parse_date),
+        date_to=optional(args.date_to, parse_date),
+        category=optional(args.category, parse_category_name),
+        tx_type=optional(args.type, parse_type),
+        keyword=(args.q.strip() or None) if args.q is not None else None,
+        tag=(args.tag.strip() or None) if args.tag is not None else None,
     )
-    parser.add_argument("--data-dir", default="./data",         # --data-dir이라는 옵션을 등록, -- ->  넣어도 되고 안 넣어도 되는 선택 옵션, default="./data" ->  옵션을 안 넣었을 때 쓰는 기본값
+    rows, total = service.search(flt, args.limit)
+    if not rows:
+        print("조건에 맞는 거래가 없습니다.")
+        return EXIT_OK
+    print(format_transactions(rows))
+    print(f"(조건 일치 {total}건 중 최신순 {len(rows)}건 표시)")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_summary(args: argparse.Namespace, service: BudgetService) -> int:
+    month = parse_month(args.month)
+    print(format_summary(service.monthly_summary(month, args.top)))
+    return EXIT_OK
+
+
+@log_execution
+def cmd_budget_set(args: argparse.Namespace, service: BudgetService) -> int:
+    month = parse_month(args.month)
+    amount = parse_amount(args.amount)
+    previous = service.set_budget(month, amount)
+    print(f"[저장 완료] {month} 예산 {won(amount)}")
+    if previous is not None and previous != amount:
+        print(f"  (기존 예산 {won(previous)}에서 변경)")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_budget_show(args: argparse.Namespace, service: BudgetService) -> int:
+    if args.month is not None:
+        month = parse_month(args.month)
+        amount = service.get_budget(month)
+        if amount is None:
+            print(f"{month} 예산이 설정되지 않았습니다.")
+            print(f"[힌트] budget set --month {month} --amount 500000")
+        else:
+            print(f"{month} 예산: {won(amount)}")
+        return EXIT_OK
+
+    budgets = service.all_budgets()
+    if not budgets:
+        print("설정된 예산이 없습니다.")
+        print("[힌트] budget set --month 2024-01 --amount 500000")
+        return EXIT_OK
+    for month, amount in sorted(budgets.items()):
+        print(f"- {month}: {won(amount)}")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_category_add(args: argparse.Namespace, service: BudgetService) -> int:
+    name = (parse_category_name(args.name) if args.name is not None
+            else ask("카테고리명: ", parse_category_name))
+    service.add_category(name)
+    print(f"[저장 완료] category={name}")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_category_list(args: argparse.Namespace, service: BudgetService) -> int:
+    names = service.list_categories()
+    if not names:
+        print("등록된 카테고리가 없습니다.")
+        return EXIT_OK
+    for name in names:
+        print(f"- {name}")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_category_remove(args: argparse.Namespace, service: BudgetService) -> int:
+    name = (parse_category_name(args.name) if args.name is not None
+            else ask("삭제할 카테고리명: ", parse_category_name))
+    service.remove_category(name)
+    print(f"[삭제 완료] category={name}")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_update(args: argparse.Namespace, service: BudgetService) -> int:
+    tx_id = parse_tx_id(args.id)
+    changes: dict[str, Any] = {}
+    if args.date is not None:
+        changes["date"] = parse_date(args.date)
+    if args.type is not None:
+        changes["type"] = parse_type(args.type)
+    if args.category is not None:
+        changes["category"] = parse_category_name(args.category)
+    if args.amount is not None:
+        changes["amount"] = parse_amount(args.amount)
+    if args.memo is not None:
+        changes["memo"] = args.memo.strip()
+    if args.tags is not None:
+        changes["tags"] = parse_tags(args.tags)
+
+    before, after = service.update_transaction(tx_id, changes)
+    print(f"[수정 완료] id={after.id}")
+    print(f"  수정 전: {format_transaction_line(before)}")
+    print(f"  수정 후: {format_transaction_line(after)}")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_delete(args: argparse.Namespace, service: BudgetService) -> int:
+    tx = service.delete_transaction(parse_tx_id(args.id))
+    print(f"[삭제 완료] {format_transaction_line(tx)}")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_import(args: argparse.Namespace, service: BudgetService) -> int:
+    result = service.import_csv(Path(args.src))
+    print(f"[완료] imported={result.imported}, skipped={result.skipped}")
+    for message in result.errors[:10]:
+        print(f"  - 건너뜀 {message}")
+    if len(result.errors) > 10:
+        print(f"  ... 외 {len(result.errors) - 10}건")
+    if result.imported == 0 and result.skipped > 0:
+        return EXIT_ERROR          # 한 건도 못 가져왔으면 실패로 종료
+    return EXIT_OK
+
+
+@log_execution
+def cmd_export(args: argparse.Namespace, service: BudgetService) -> int:
+    flt = SearchFilter(
+        month=optional(args.month, parse_month),
+        date_from=optional(args.date_from, parse_date),
+        date_to=optional(args.date_to, parse_date),
+    )
+    out = Path(args.out)
+    count = service.export_csv(out, flt)
+    print(f"[완료] {out} ({count} records)")
+    return EXIT_OK
+
+
+@log_execution
+def cmd_backup(args: argparse.Namespace, service: BudgetService) -> int:
+    dest = service.backup()
+    print(f"[완료] 백업 생성: {dest}")
+    print("[힌트] 복구하려면 이 폴더의 파일을 data 폴더로 복사해 덮어쓰세요.")
+    return EXIT_OK
+
+
+# ====================== 명령어 해석 ======================
+
+EPILOG = """\
+사용 예:
+  python -m budget_app add
+  python -m budget_app list --limit 5
+  python -m budget_app search --from 2024-01-01 --to 2024-01-31 --category food
+  python -m budget_app summary --month 2024-01 --top 3
+  python -m budget_app budget set --month 2024-01 --amount 500000
+  python -m budget_app category add --name cafe
+  python -m budget_app update --id TX-000001 --amount 20000 --memo 저녁
+  python -m budget_app delete --id TX-000001
+  python -m budget_app export --out export.csv --month 2024-01
+  python -m budget_app import --from import.csv
+
+각 명령의 자세한 사용법: python -m budget_app <명령> --help
+전역 옵션(--data-dir, --verbose)은 명령 이름보다 앞에 씁니다.
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="budget_app",
+        description="용돈 기입장(가계부) 콘솔 프로그램",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--data-dir", default="./data",
                         help="데이터 저장 폴더 (기본값: ./data)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="실행 로그와 실행 시간을 함께 출력")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
-    sub = parser.add_subparsers(dest="command", required=True) #하위 명령어를 넣을 공간을 만들어 sub에 저장,dest="command" -> 입력된 명령어 이름을 args.command에 저장, required=True -> 명령어를 꼭 입력해야 한다는 뜻
-    sub.add_parser("add", help="거래 추가 (대화형 입력)")       #add라는 하위 명령어를 등록,사용자가 add를 입력하면 args.command에 "add"가 들어감
+    sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
-    p_list = sub.add_parser("list", help="거래 목록 (최신순)")#?????
-    p_list.add_argument("--limit", type=positive_int, default=10,
-                        help="출력할 최대 개수 (기본값: 10)")
-    return parser #설정이 끝난 해석기 반환, 실제 해석은 main의 parser.parse_args(argv)에서함
+    # add
+    p = sub.add_parser("add", help="거래 추가 (대화형 입력)",
+                       description="날짜, 타입, 카테고리, 금액, 메모, 태그를 차례로 입력받아 저장합니다.")
+    p.set_defaults(handler=cmd_add)
+
+    # list
+    p = sub.add_parser("list", help="거래 목록 (날짜 최신순)",
+                       description="거래를 날짜 최신순으로 출력합니다.")
+    p.add_argument("--limit", type=positive_int, default=10, help="출력할 최대 개수 (기본값: 10)")
+    p.set_defaults(handler=cmd_list)
+
+    # search
+    p = sub.add_parser("search", help="조건 검색 (날짜 최신순)",
+                       description="여러 조건을 함께 쓰면 모두 만족하는 거래만 출력합니다(AND).")
+    p.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD", help="시작 날짜 (포함)")
+    p.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD", help="끝 날짜 (포함)")
+    p.add_argument("--category", help="카테고리")
+    p.add_argument("--type", help="income 또는 expense")
+    p.add_argument("--q", metavar="KEYWORD", help="메모에 포함된 키워드 (대소문자 무시)")
+    p.add_argument("--tag", help="태그")
+    p.add_argument("--limit", type=positive_int, default=20, help="출력할 최대 개수 (기본값: 20)")
+    p.set_defaults(handler=cmd_search)
+
+    # summary
+    p = sub.add_parser("summary", help="월별 요약 (수입/지출/잔액/예산/지출 TOP N)",
+                       description="해당 월의 총수입, 총지출, 잔액, 예산 사용률, 카테고리별 지출 TOP N을 출력합니다.")
+    p.add_argument("--month", required=True, metavar="YYYY-MM", help="요약할 월")
+    p.add_argument("--top", type=positive_int, default=5, help="지출 상위 카테고리 개수 (기본값: 5)")
+    p.set_defaults(handler=cmd_summary)
+
+    # budget set / show
+    p = sub.add_parser("budget", help="월 예산 설정/조회 (set / show)",
+                       description="월 예산을 설정하거나 조회합니다.")
+    budget_sub = p.add_subparsers(dest="budget_command", required=True, metavar="<set|show>")
+    bp = budget_sub.add_parser("set", help="월 예산 설정 (같은 월이면 덮어씀)")
+    bp.add_argument("--month", required=True, metavar="YYYY-MM")
+    bp.add_argument("--amount", required=True, help="예산 금액 (양의 정수)")
+    bp.set_defaults(handler=cmd_budget_set)
+    bp = budget_sub.add_parser("show", help="예산 조회 (--month 생략 시 전체)")
+    bp.add_argument("--month", metavar="YYYY-MM")
+    bp.set_defaults(handler=cmd_budget_show)
+
+    # category add / list / remove
+    p = sub.add_parser("category", help="카테고리 관리 (add / list / remove)",
+                       description="카테고리를 추가, 조회, 삭제합니다. 사용 중인 카테고리는 삭제할 수 없습니다.")
+    cat_sub = p.add_subparsers(dest="category_command", required=True, metavar="<add|list|remove>")
+    cp = cat_sub.add_parser("add", help="카테고리 추가 (--name 생략 시 대화형 입력)")
+    cp.add_argument("--name", help="추가할 카테고리명")
+    cp.set_defaults(handler=cmd_category_add)
+    cp = cat_sub.add_parser("list", help="카테고리 목록")
+    cp.set_defaults(handler=cmd_category_list)
+    cp = cat_sub.add_parser("remove", help="카테고리 삭제 (--name 생략 시 대화형 입력)")
+    cp.add_argument("--name", help="삭제할 카테고리명")
+    cp.set_defaults(handler=cmd_category_remove)
+
+    # update (옵션 방식으로 고정)
+    p = sub.add_parser("update", help="거래 수정 (옵션 방식)",
+                       description="지정한 옵션의 필드만 수정합니다. 최소 1개 이상 지정하세요. "
+                                   "--memo \"\" 또는 --tags \"\"로 비울 수 있습니다.")
+    p.add_argument("--id", required=True, help="수정할 거래 id (예: TX-000001)")
+    p.add_argument("--date", metavar="YYYY-MM-DD")
+    p.add_argument("--type", help="income 또는 expense")
+    p.add_argument("--category")
+    p.add_argument("--amount", help="양의 정수")
+    p.add_argument("--memo")
+    p.add_argument("--tags", help="쉼표로 구분 (예: meal,lunch)")
+    p.set_defaults(handler=cmd_update)
+
+    # delete
+    p = sub.add_parser("delete", help="거래 삭제", description="id로 거래 한 건을 삭제합니다.")
+    p.add_argument("--id", required=True, help="삭제할 거래 id (예: TX-000001)")
+    p.set_defaults(handler=cmd_delete)
+
+    # import
+    p = sub.add_parser("import", help="CSV 가져오기",
+                       description="CSV(date,type,category,amount,memo,tags)의 올바른 행을 새 거래로 추가합니다.")
+    p.add_argument("--from", dest="src", required=True, metavar="CSV", help="가져올 CSV 파일 경로")
+    p.set_defaults(handler=cmd_import)
+
+    # export
+    p = sub.add_parser("export", help="CSV 내보내기",
+                       description="조건에 맞는 거래를 CSV로 저장합니다. "
+                                   "--month 또는 --from/--to 중 하나 이상이 필요합니다.")
+    p.add_argument("--out", required=True, metavar="CSV", help="저장할 CSV 파일 경로 (있으면 덮어씀)")
+    p.add_argument("--month", metavar="YYYY-MM")
+    p.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD")
+    p.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD")
+    p.set_defaults(handler=cmd_export)
+
+    # backup (보너스)
+    p = sub.add_parser("backup", help="저장 파일 백업 (data/backups/<시각>/)",
+                       description="현재 저장 파일 3개를 타임스탬프 폴더에 복사합니다.")
+    p.set_defaults(handler=cmd_backup)
+
+    return parser
 
 
-def main(argv: list[str] | None = None) -> int:  
-    """ argv->"argument vector"의 줄임말로, 명령어 뒤에 붙은 단어들의 목록을 뜻하는 전통적인 이름
-        list[str] | None**, 타입 힌트로, "문자열 리스트이거나 None"이라는 뜻, | ->"또는" 이라는 뜻
-        __main__.py에서는 main()을 인자 없이 부름으로 평소엔 첫 번째 방식으로 동작, 두 번째는 나중에 터미널을 안 거치고 코드로 직접 테스트하고 싶을 때사용 
-        ~ -> int 는 이 값이 __main__.py의 sys.exit(main())으로 넘어가서 운영체제에 전달된다는뜻"""
-    
-    parser = build_parser()                          #이 프로그램은 --data-dir 옵션이 있고, add라는 명령이 있다" 같은 규칙을 등록한 argparse 객체를 돌려줌,아직 사용자 입력을 읽은 건 아니고, 규칙표만 만든 상태
-    args = parser.parse_args(argv)                   #규칙표를 가지고 실제 입력을 해석하는 줄, argv가 None이면 argparse가 알아서 터미널에 입력된 내용(sys.argv[1:])을 가져다 사용, 리스트가 들어오면 그걸 해석, 결과로 나오는 args는 해석 결과를 담은 상자예요. 점(.)으로 꺼내 사용
-    repo = TransactionRepository(Path(args.data_dir))# 해석된 폴더 경로(기본값 ./data)를 Path로 감싸 저장소 생성. 이때 폴더와 transactions.jsonl 파일이 없으면 만들어짐
+# ====================== 실행 ======================
+
+def build_service(data_dir: Path) -> tuple[BudgetService, list[str]]:
+    """저장소 3개와 서비스를 만들고, 초기화 안내 문구를 함께 돌려준다."""
+    transactions = TransactionRepository(data_dir)
+    categories = CategoryStore(data_dir)
+    budgets = BudgetStore(data_dir)
+
+    notices: list[str] = []
+    created = [s.path.name for s in (transactions, categories, budgets) if s.created]
+    if created:
+        notices.append(f"[안내] 저장 파일을 새로 만들었습니다: {data_dir} ({', '.join(created)})")
+    if categories.created_defaults:
+        notices.append(f"[안내] 카테고리가 비어 있어 기본 카테고리를 등록했습니다: "
+                       f"{', '.join(DEFAULT_CATEGORIES)}")
+    return BudgetService(transactions, categories, budgets), notices
 
 
-    if args.command == "add": # 입력된 명령어가 add면
-        return cmd_add(repo)  #거래 추가 실행하고, 그 결과(성공 시 0)를 그대로 돌려줌
-    if args.command == "list": #????
-        return cmd_list(repo, args.limit)
-    return 1                  # 처리할 수 없는 명령어면 1(실패) 반환
+@handle_errors
+def run(args: argparse.Namespace) -> int:
+    service, notices = build_service(Path(args.data_dir))
+    for notice in notices:
+        print(notice)
+    handler: Handler = args.handler
+    return handler(args, service)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)     # 잘못된 옵션은 argparse가 사용법과 함께 종료 코드 2로 처리
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="[log] %(message)s",
+    )
+    return run(args)

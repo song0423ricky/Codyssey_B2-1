@@ -1,3 +1,4 @@
+"""`python -m budget_app` 실행 시 진입점"""
 import sys
 
 from .cli import main

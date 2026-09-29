@@ -1,0 +1,9 @@
+date,type,category,amount,memo,tags
+2024-01-03,income,salary,3000000,1월 월급,"monthly,work"
+2024-01-05,expense,rent,150000,월세,monthly
+2024-01-07,expense,food,12000,점심 김밥,meal
+2024-01-10,expense,transport,20000,교통카드 충전,
+2024-01-15,expense,food,33000,저녁 회식,"meal,dinner"
+2024-01-12,expense,unknown,5000,등록 안 된 카테고리 예시,
+2024-13-01,expense,food,8000,잘못된 날짜 예시,
+2024-01-20,expense,food,-500,음수 금액 예시,
